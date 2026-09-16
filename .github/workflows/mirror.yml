@@ -2,11 +2,11 @@ name: mirror
 
 on:
   schedule:
-    - cron: '17 */6 * * *'   # 每 6 小时检查官方 appcast
+    - cron: '17 */6 * * *'   # 每 6 小时检查各官方源
   workflow_dispatch:
     inputs:
       max_per_run:
-        description: '本次最多新建多少个 Release（其余留给后续定时补齐）'
+        description: 'mac 轨本次最多新建多少个 Release（其余留给后续定时补齐）'
         default: '8'
 
 permissions:
@@ -23,7 +23,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Mirror official Telegram-macOS installers
+      # ───────────────────────── mac: Telegram for macOS (Swift, osx.telegram.org appcast)
+      - name: Mirror · macOS (Telegram-Swift)
         env:
           GH_TOKEN: ${{ github.token }}
           MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '8' }}
@@ -31,67 +32,83 @@ jobs:
           BASE: https://osx.telegram.org/updates
         run: |
           set -euo pipefail
-
-          echo "拉取官方 appcast: $FEED"
           curl -fsSL --retry 3 "$FEED" -o feed.xml
-
-          # 解析所有 <enclosure>：ver \t build \t app.zip url \t dmgName（feed 顺序=新→旧）
-          python3 - <<'PY' > entries.tsv
+          python3 - <<'PY' > mac.tsv
           import re
           xml = open('feed.xml', encoding='utf-8', errors='replace').read()
           for enc in re.findall(r'<enclosure\b[^>]*/>', xml):
               g = lambda k: (re.search(k + r'="([^"]*)"', enc) or [None, ''])[1]
-              ver, build = g('sparkle:shortVersionString'), g('sparkle:version')
-              url, dmg = g('url'), g('dmgName')
+              ver, build, url, dmg = g('sparkle:shortVersionString'), g('sparkle:version'), g('url'), g('dmgName')
               if ver and build and url:
                   print(f"{ver}\t{build}\t{url}\t{dmg}")
           PY
-
-          test -s entries.tsv || { echo "feed 解析为空，异常退出"; exit 1; }
-          newest_tag="$(head -n1 entries.tsv | awk -F'\t' '{print $1"."$2}')"
-          echo "feed 最新: $newest_tag（共 $(wc -l < entries.tsv) 条）"
-
+          test -s mac.tsv || { echo "mac feed 空，异常"; exit 1; }
+          newest="mac-$(head -n1 mac.tsv | awk -F'\t' '{print $1"."$2}')"
           made=0
           while IFS=$'\t' read -r ver build url dmg; do
-            tag="$ver.$build"
-            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "已归档，跳过 $tag"; continue
-            fi
-            if [ "$made" -ge "$MAX_PER_RUN" ]; then
-              echo "达到 max_per_run=$MAX_PER_RUN，其余留给下次"; break
-            fi
-
-            echo "::group::归档 $tag"
-            appzip="Telegram-${ver}.${build}.app.zip"
-            files=()
-            echo "下载 $url"
+            tag="mac-${ver}.${build}"
+            gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && { echo "skip $tag"; continue; }
+            [ "$made" -ge "$MAX_PER_RUN" ] && { echo "mac 达 max_per_run"; break; }
+            echo "::group::$tag"
+            appzip="Telegram-${ver}.${build}.app.zip"; files=()
             curl -fL --retry 3 "$url" -o "$appzip" && files+=("$appzip")
-            if [ -n "$dmg" ]; then
-              echo "下载 $BASE/$dmg"
-              curl -fL --retry 3 "$BASE/$dmg" -o "$dmg" && files+=("$dmg")
-            fi
-            [ "${#files[@]}" -gt 0 ] || { echo "无文件下载成功，跳过 $tag"; echo "::endgroup::"; continue; }
+            [ -n "$dmg" ] && curl -fL --retry 3 "$BASE/$dmg" -o "$dmg" && files+=("$dmg")
+            [ "${#files[@]}" -gt 0 ] || { echo "无文件, skip"; echo "::endgroup::"; continue; }
+            sha256sum "${files[@]}" > SHA256SUMS.txt; files+=("SHA256SUMS.txt")
+            notes="$(printf 'Telegram for macOS（Swift 版）**%s** build %s\n\n官方原版，未经修改，镜像自 `%s/`。\n\n**SHA-256**\n```\n%s\n```\n' "$ver" "$build" "$BASE" "$(cat SHA256SUMS.txt)")"
+            latest=--latest=false; [ "$tag" = "$newest" ] && latest=--latest=true
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "macOS · Telegram $ver ($build)" --notes "$notes" $latest "${files[@]}"
+            rm -f "${files[@]}"; made=$((made+1)); echo "::endgroup::"
+          done < mac.tsv
+          echo "mac: 新建 $made"
 
-            sha256sum "${files[@]}" > SHA256SUMS.txt
-            files+=("SHA256SUMS.txt")
+      # ───────────────────────── desktop: Telegram Desktop (tdesktop) 全平台，转存官方 GitHub release
+      - name: Mirror · Telegram Desktop (all platforms)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rel="$(gh api repos/telegramdesktop/tdesktop/releases/latest)"
+          ver="$(echo "$rel" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"].lstrip("v"))')"
+          tag="desktop-${ver}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "skip $tag"; exit 0; fi
+          echo "::group::$tag"
+          mkdir -p dl && cd dl
+          echo "$rel" | python3 -c 'import json,sys;[print(a["browser_download_url"]) for a in json.load(sys.stdin)["assets"]]' > urls.txt
+          while read -r u; do echo "下载 $u"; curl -fL --retry 3 -O "$u"; done < urls.txt
+          sha256sum * > SHA256SUMS.txt
+          notes="$(printf 'Telegram Desktop（tdesktop，C++/Qt）**%s** · 全平台\n\n官方原版，转存自 `github.com/telegramdesktop/tdesktop` release %s（Windows x64/x86/arm 安装+便携、macOS(Qt) dmg、Linux）。\n\n**SHA-256**\n```\n%s\n```\n' "$ver" "v$ver" "$(cat SHA256SUMS.txt)")"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "Desktop · Telegram Desktop $ver" --notes "$notes" --latest=false ./*
+          cd .. && rm -rf dl; echo "::endgroup::"
 
-            notes="$(printf 'Telegram for macOS **%s**（build %s）\n\n官方原版，未经修改，镜像自 `%s/`。\n\n**SHA-256**\n```\n%s\n```\n' \
-              "$ver" "$build" "$BASE" "$(cat SHA256SUMS.txt)")"
+      # ───────────────────────── android: 官网直装 APK (org.telegram.messenger)
+      - name: Mirror · Android APK (official website build)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pip3 install --quiet pyaxmlparser
+          echo "下载官网 APK"
+          curl -fL --retry 3 -A 'Mozilla/5.0' "https://telegram.org/dl/android/apk" -o Telegram.apk
+          ver="$(python3 - <<'PY'
+          from pyaxmlparser import APK
+          print((APK('Telegram.apk').version_name or '').strip())
+          PY
+          )"
+          [ -n "$ver" ] || { echo "无法解析 APK versionName，跳过"; exit 0; }
+          tag="android-${ver}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "skip $tag"; exit 0; fi
+          out="Telegram-${ver}.apk"; mv Telegram.apk "$out"
+          sha256sum "$out" > SHA256SUMS.txt
+          notes="$(printf 'Telegram for Android（org.telegram.messenger）**%s** · 官网直装版\n\n官方原版，未经修改，镜像自 `https://telegram.org/dl/android/apk`（非 Play 版，带应用内更新）。\n\n**SHA-256**\n```\n%s\n```\n' "$ver" "$(cat SHA256SUMS.txt)")"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "Android · Telegram $ver" --notes "$notes" --latest=false "$out" SHA256SUMS.txt
+          rm -f "$out" SHA256SUMS.txt; echo "created $tag"
 
-            latest=--latest=false
-            [ "$tag" = "$newest_tag" ] && latest=--latest=true
-
-            gh release create "$tag" -R "$GITHUB_REPOSITORY" \
-              --title "Telegram $ver ($build)" --notes "$notes" $latest "${files[@]}"
-
-            rm -f "${files[@]}"
-            made=$((made + 1))
-            echo "::endgroup::"
-          done < entries.tsv
-
-          echo "本次新建 $made 个 Release"
-
+      # ───────────────────────── 清单刷新（保活）
       - name: Refresh MIRRORED.md manifest (keep-alive)
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -101,19 +118,15 @@ jobs:
             echo
             echo "> 由 mirror workflow 自动刷新 · $(date -u '+%Y-%m-%d %H:%M UTC')"
             echo
-            echo "| 版本 | build | 发布时间(UTC) |"
-            echo "|---|---|---|"
-            gh release list -R "$GITHUB_REPOSITORY" --limit 200 \
-              --json tagName,name,createdAt \
-              --jq 'sort_by(.tagName)|reverse|.[]|"| \(.name) | \(.tagName) | \(.createdAt[0:16]|sub("T";" ")) |"'
+            echo "| 轨 | 标题 | tag | 发布(UTC) |"
+            echo "|---|---|---|---|"
+            gh release list -R "$GITHUB_REPOSITORY" --limit 300 --json tagName,name,createdAt \
+              --jq 'sort_by(.tagName)|reverse|.[]|"| \(.tagName|split("-")[0]) | \(.name) | \(.tagName) | \(.createdAt[0:16]|sub("T";" ")) |"'
           } > MIRRORED.md
-
           if ! git diff --quiet -- MIRRORED.md 2>/dev/null; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add MIRRORED.md
-            git commit -m "chore: refresh mirrored manifest"
-            git push
+            git add MIRRORED.md && git commit -m "chore: refresh mirrored manifest" && git push
           else
-            echo "MIRRORED.md 无变化，不提交"
+            echo "MIRRORED.md 无变化"
           fi
