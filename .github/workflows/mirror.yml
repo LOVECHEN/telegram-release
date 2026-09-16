@@ -1,0 +1,119 @@
+name: mirror
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # 每 6 小时检查官方 appcast
+  workflow_dispatch:
+    inputs:
+      max_per_run:
+        description: '本次最多新建多少个 Release（其余留给后续定时补齐）'
+        default: '8'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mirror official Telegram-macOS installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '8' }}
+          FEED: https://osx.telegram.org/updates/versions.xml
+          BASE: https://osx.telegram.org/updates
+        run: |
+          set -euo pipefail
+
+          echo "拉取官方 appcast: $FEED"
+          curl -fsSL --retry 3 "$FEED" -o feed.xml
+
+          # 解析所有 <enclosure>：ver \t build \t app.zip url \t dmgName（feed 顺序=新→旧）
+          python3 - <<'PY' > entries.tsv
+          import re
+          xml = open('feed.xml', encoding='utf-8', errors='replace').read()
+          for enc in re.findall(r'<enclosure\b[^>]*/>', xml):
+              g = lambda k: (re.search(k + r'="([^"]*)"', enc) or [None, ''])[1]
+              ver, build = g('sparkle:shortVersionString'), g('sparkle:version')
+              url, dmg = g('url'), g('dmgName')
+              if ver and build and url:
+                  print(f"{ver}\t{build}\t{url}\t{dmg}")
+          PY
+
+          test -s entries.tsv || { echo "feed 解析为空，异常退出"; exit 1; }
+          newest_tag="$(head -n1 entries.tsv | awk -F'\t' '{print $1"."$2}')"
+          echo "feed 最新: $newest_tag（共 $(wc -l < entries.tsv) 条）"
+
+          made=0
+          while IFS=$'\t' read -r ver build url dmg; do
+            tag="$ver.$build"
+            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "已归档，跳过 $tag"; continue
+            fi
+            if [ "$made" -ge "$MAX_PER_RUN" ]; then
+              echo "达到 max_per_run=$MAX_PER_RUN，其余留给下次"; break
+            fi
+
+            echo "::group::归档 $tag"
+            appzip="Telegram-${ver}.${build}.app.zip"
+            files=()
+            echo "下载 $url"
+            curl -fL --retry 3 "$url" -o "$appzip" && files+=("$appzip")
+            if [ -n "$dmg" ]; then
+              echo "下载 $BASE/$dmg"
+              curl -fL --retry 3 "$BASE/$dmg" -o "$dmg" && files+=("$dmg")
+            fi
+            [ "${#files[@]}" -gt 0 ] || { echo "无文件下载成功，跳过 $tag"; echo "::endgroup::"; continue; }
+
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+            files+=("SHA256SUMS.txt")
+
+            notes="$(printf 'Telegram for macOS **%s**（build %s）\n\n官方原版，未经修改，镜像自 `%s/`。\n\n**SHA-256**\n```\n%s\n```\n' \
+              "$ver" "$build" "$BASE" "$(cat SHA256SUMS.txt)")"
+
+            latest=--latest=false
+            [ "$tag" = "$newest_tag" ] && latest=--latest=true
+
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+              --title "Telegram $ver ($build)" --notes "$notes" $latest "${files[@]}"
+
+            rm -f "${files[@]}"
+            made=$((made + 1))
+            echo "::endgroup::"
+          done < entries.tsv
+
+          echo "本次新建 $made 个 Release"
+
+      - name: Refresh MIRRORED.md manifest (keep-alive)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# 已归档版本"
+            echo
+            echo "> 由 mirror workflow 自动刷新 · $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "| 版本 | build | 发布时间(UTC) |"
+            echo "|---|---|---|"
+            gh release list -R "$GITHUB_REPOSITORY" --limit 200 \
+              --json tagName,name,createdAt \
+              --jq 'sort_by(.tagName)|reverse|.[]|"| \(.name) | \(.tagName) | \(.createdAt[0:16]|sub("T";" ")) |"'
+          } > MIRRORED.md
+
+          if ! git diff --quiet -- MIRRORED.md 2>/dev/null; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add MIRRORED.md
+            git commit -m "chore: refresh mirrored manifest"
+            git push
+          else
+            echo "MIRRORED.md 无变化，不提交"
+          fi
