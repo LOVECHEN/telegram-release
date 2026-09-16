@@ -57,7 +57,7 @@ jobs:
             sha256sum "${files[@]}" > SHA256SUMS.txt; files+=("SHA256SUMS.txt")
             notes="$(printf 'Telegram for macOS（Swift 版）**%s** build %s\n\n官方原版，未经修改，镜像自 `%s/`。\n\n**SHA-256**\n```\n%s\n```\n' "$ver" "$build" "$BASE" "$(cat SHA256SUMS.txt)")"
             latest=--latest=false; [ "$tag" = "$newest" ] && latest=--latest=true
-            gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "macOS · Telegram $ver ($build)" --notes "$notes" $latest "${files[@]}"
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "🍎 macOS · Telegram $ver ($build)" --notes "$notes" $latest "${files[@]}"
             rm -f "${files[@]}"; made=$((made+1)); echo "::endgroup::"
           done < mac.tsv
           echo "mac: 新建 $made"
@@ -79,7 +79,7 @@ jobs:
           while read -r u; do echo "下载 $u"; curl -fL --retry 3 -O "$u"; done < urls.txt
           sha256sum * > SHA256SUMS.txt
           notes="$(printf 'Telegram Desktop（tdesktop，C++/Qt）**%s** · 全平台\n\n官方原版，转存自 `github.com/telegramdesktop/tdesktop` release %s（Windows x64/x86/arm 安装+便携、macOS(Qt) dmg、Linux）。\n\n**SHA-256**\n```\n%s\n```\n' "$ver" "v$ver" "$(cat SHA256SUMS.txt)")"
-          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "Desktop · Telegram Desktop $ver" --notes "$notes" --latest=false ./*
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "🖥️ Desktop · Telegram Desktop $ver（Win/mac/Linux）" --notes "$notes" --latest=false ./*
           cd .. && rm -rf dl; echo "::endgroup::"
 
       # ───────────────────────── android: 官网直装 APK (org.telegram.messenger)
@@ -103,7 +103,7 @@ jobs:
           out="Telegram-${ver}.apk"; mv Telegram.apk "$out"
           sha256sum "$out" > SHA256SUMS.txt
           notes="$(printf 'Telegram for Android（org.telegram.messenger）**%s** · 官网直装版\n\n官方原版，未经修改，镜像自 `https://telegram.org/dl/android/apk`（非 Play 版，带应用内更新）。\n\n**SHA-256**\n```\n%s\n```\n' "$ver" "$(cat SHA256SUMS.txt)")"
-          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "Android · Telegram $ver" --notes "$notes" --latest=false "$out" SHA256SUMS.txt
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "🤖 Android · Telegram $ver（APK）" --notes "$notes" --latest=false "$out" SHA256SUMS.txt
           rm -f "$out" SHA256SUMS.txt; echo "created $tag"
 
       # ───────────────────────── 清单刷新（保活）
